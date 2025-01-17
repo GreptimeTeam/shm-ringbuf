@@ -150,6 +150,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to establish session: {}, at {}", error, loc))]
+    EstablishSession {
+        error: String,
+        #[snafu(implicit)]
+        loc: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -172,3 +179,4 @@ impl DataProcessResult {
 /// 100000 - 200000 are error codes used internally by shm-ringbuf and should
 /// not be used as business codes.
 pub const CHECKSUM_MISMATCH: u32 = 100000;
+pub const DECODE_ERROR: u32 = 10001;

@@ -208,6 +208,9 @@ impl Drop for RingbufProducer {
     }
 }
 
+pub const SESSION_ESTABLISHED: u32 = 0;
+pub const SESSION_ESTABLISHING_ERROR: u32 = 1;
+
 /// The [`SessionHandle`] is used to send the memfd, client id and ringbuf len
 /// to the consumer.
 pub(crate) struct SessionHandle {
