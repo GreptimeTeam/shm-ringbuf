@@ -1,3 +1,6 @@
+use passfd::tokio::FdPassingExt;
+use snafu::location;
+use snafu::ResultExt;
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -7,10 +10,6 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
-
-use passfd::tokio::FdPassingExt;
-use snafu::location;
-use snafu::ResultExt;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -22,7 +21,8 @@ use tracing::{error, info, warn};
 use crate::consumer::session_manager::Session;
 use crate::consumer::session_manager::SessionManagerRef;
 use crate::error;
-use crate::error::Result;
+use crate::error::{EstablishSessionSnafu, Result};
+use crate::producer::{SESSION_ESTABLISHED, SESSION_ESTABLISHING_ERROR};
 use crate::ringbuf::Ringbuf;
 
 /// The server for receiving fd from producer, create Ringbuf, and add the Ringbuf
@@ -125,7 +125,7 @@ where
         };
 
         tokio::spawn(async move {
-            if let Err(e) = handler.handle().await {
+            if let Err(e) = handler.create_session().await {
                 error!("handle error: {}", e);
             }
         });
@@ -140,6 +140,30 @@ struct Handler {
 }
 
 impl Handler {
+    async fn create_session(&mut self) -> Result<()> {
+        let result = self.handle().await;
+        let stream = &mut self.stream;
+        match result {
+            Ok(()) => stream
+                .write_u32(SESSION_ESTABLISHED)
+                .await
+                .context(error::IoSnafu),
+            Err(e) => {
+                stream
+                    .write_u32(SESSION_ESTABLISHING_ERROR)
+                    .await
+                    .context(error::IoSnafu)?;
+
+                let e = e.to_string();
+                stream
+                    .write_u32(e.len() as u32)
+                    .await
+                    .context(error::IoSnafu)?;
+                stream.write_all(e.as_bytes()).await.context(error::IoSnafu)
+            }
+        }
+    }
+
     async fn handle(&mut self) -> Result<()> {
         let stream = &mut self.stream;
 
@@ -225,7 +249,26 @@ pub async fn send_fd(
     stream
         .send_fd(file.as_raw_fd())
         .await
-        .context(error::IoSnafu)
+        .context(error::IoSnafu)?;
+
+    let result = stream.read_u32().await.context(error::IoSnafu)?;
+    match result {
+        SESSION_ESTABLISHED => Ok(()),
+        SESSION_ESTABLISHING_ERROR => {
+            let error_len = stream.read_u32().await.context(error::IoSnafu)?;
+            let mut error = vec![0; error_len as usize];
+            let read = stream
+                .read_exact(&mut error)
+                .await
+                .context(error::IoSnafu)?;
+            assert_eq!(read, error.len());
+            EstablishSessionSnafu {
+                error: String::from_utf8_lossy(&error).to_string(),
+            }
+            .fail()
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[cfg(test)]

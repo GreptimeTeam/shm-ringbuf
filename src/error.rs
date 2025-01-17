@@ -150,6 +150,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to establish session: {}, at {}", error, loc))]
+    EstablishSession {
+        error: String,
+        #[snafu(implicit)]
+        loc: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
