@@ -1,7 +1,7 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use snafu::ResultExt;
@@ -28,11 +28,17 @@ pub struct ResultFetcher {
     inner: Arc<Inner>,
 }
 
+pub struct ResultFetcherMetrics {
+    pub requests: AtomicU64,
+    pub total_wait_micros: AtomicU64,
+}
+
 struct Inner {
     grpc_client: GrpcClient,
     retry_interval: Duration,
     normal: AtomicBool,
-    subscriptions: DashMap<RequestId, Sender<DataProcessResult>>,
+    subscriptions: DashMap<RequestId, (Sender<DataProcessResult>, Instant)>,
+    metrics: ResultFetcherMetrics,
 }
 
 impl ResultFetcher {
@@ -48,6 +54,10 @@ impl ResultFetcher {
             retry_interval,
             normal,
             subscriptions,
+            metrics: ResultFetcherMetrics {
+                requests: AtomicU64::new(0),
+                total_wait_micros: AtomicU64::new(0),
+            },
         };
         let inner = Arc::new(inner);
 
@@ -87,7 +97,9 @@ impl ResultFetcher {
     /// Subscribe to the result set corresponding to the request id.
     pub fn subscribe(&self, request_id: u32) -> Receiver<DataProcessResult> {
         let (tx, rx) = channel();
-        self.inner.subscriptions.insert(request_id, tx);
+        self.inner
+            .subscriptions
+            .insert(request_id, (tx, Instant::now()));
         rx
     }
 
@@ -119,13 +131,25 @@ impl ResultFetcher {
     async fn handle_result(&self, result: ResultSet) {
         for result in result.results {
             let subscription = self.inner.subscriptions.remove(&result.id);
-            if let Some((_, sender)) = subscription {
+            if let Some((_, (sender, start))) = subscription {
                 let result = DataProcessResult {
                     status_code: result.status_code,
                     message: result.message,
                 };
                 let _ = sender.send(result);
+
+                self.inner.metrics.requests.fetch_add(1, Ordering::Relaxed);
+
+                let elapsed = start.elapsed().as_micros() as u64;
+                self.inner
+                    .metrics
+                    .total_wait_micros
+                    .fetch_add(elapsed, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn metrics(&self) -> &ResultFetcherMetrics {
+        &self.inner.metrics
     }
 }
