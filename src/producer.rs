@@ -1,7 +1,7 @@
 pub mod prealloc;
 pub mod settings;
 
-mod fetch;
+pub mod fetch;
 mod heartbeat;
 
 use std::fs::File;
@@ -33,7 +33,7 @@ pub struct RingbufProducer {
     online: Arc<AtomicBool>,
     cancel: CancellationToken,
     req_id: AtomicU32,
-    result_fetcher: Option<ResultFetcher>,
+    pub result_fetcher: Option<ResultFetcher>,
     enable_checksum: bool,
 }
 

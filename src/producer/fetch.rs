@@ -1,10 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use snafu::ensure;
@@ -33,12 +32,18 @@ pub struct ResultFetcher {
     inner: Arc<Inner>,
 }
 
+pub struct ResultFetcherMetrics {
+    pub requests: AtomicU64,
+    pub total_wait_micros: AtomicU64,
+}
+
 struct Inner {
     grpc_client: GrpcClient,
     normal: AtomicBool,
-    subscriptions: DashMap<RequestId, Sender<DataProcessResult>>,
+    subscriptions: DashMap<RequestId, (Sender<DataProcessResult>, Instant)>,
     subscription_ttl: Duration,
     expirations: RwLock<VecDeque<(RequestId, Instant)>>,
+    metrics: ResultFetcherMetrics,
 }
 
 impl ResultFetcher {
@@ -60,6 +65,10 @@ impl ResultFetcher {
             subscriptions,
             subscription_ttl,
             expirations,
+            metrics: ResultFetcherMetrics {
+                requests: AtomicU64::new(0),
+                total_wait_micros: AtomicU64::new(0),
+            },
         };
         let inner = Arc::new(inner);
 
@@ -123,7 +132,9 @@ impl ResultFetcher {
         ensure!(self.is_normal(), error::ResultFetchNotReadySnafu);
 
         let (tx, rx) = channel();
-        self.inner.subscriptions.insert(request_id, tx);
+        self.inner
+            .subscriptions
+            .insert(request_id, (tx, Instant::now()));
         let expired_at = Instant::now() + self.inner.subscription_ttl;
         self.inner
             .expirations
@@ -161,19 +172,31 @@ impl ResultFetcher {
     async fn handle_result(&self, result: ResultSet) {
         for result in result.results {
             let subscription = self.inner.subscriptions.remove(&result.id);
-            if let Some((_, sender)) = subscription {
+            if let Some((_, (sender, start))) = subscription {
                 let result = DataProcessResult {
                     status_code: result.status_code,
                     message: result.message,
                 };
                 let _ = sender.send(result);
+
+                self.inner.metrics.requests.fetch_add(1, Ordering::Relaxed);
+
+                let elapsed = start.elapsed().as_micros() as u64;
+                self.inner
+                    .metrics
+                    .total_wait_micros
+                    .fetch_add(elapsed, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn metrics(&self) -> &ResultFetcherMetrics {
+        &self.inner.metrics
     }
 }
 
 fn clean_expired_subscriptions(
-    subscriptions: &DashMap<RequestId, Sender<DataProcessResult>>,
+    subscriptions: &DashMap<RequestId, (Sender<DataProcessResult>, Instant)>,
     expirations: &mut VecDeque<(RequestId, Instant)>,
 ) {
     let now = Instant::now();
@@ -190,7 +213,7 @@ fn clean_expired_subscriptions(
         debug!("subscription expired, req id: {}", req_id);
 
         if let Some((_, sender)) = subscriptions.remove(&req_id) {
-            let _ = sender.send(DataProcessResult {
+            let _ = sender.0.send(DataProcessResult {
                 status_code: error::TIMEOUT,
                 message: "subscription expired".to_string(),
             });
@@ -201,7 +224,7 @@ fn clean_expired_subscriptions(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use dashmap::DashMap;
 
@@ -209,7 +232,7 @@ mod tests {
     async fn test_clean_expired_subscriptions() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let subscriptions = DashMap::new();
-        subscriptions.insert(1, tx);
+        subscriptions.insert(1, (tx, Instant::now()));
 
         let mut expirations = VecDeque::new();
         expirations

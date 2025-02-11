@@ -6,7 +6,7 @@ pub(crate) mod session_manager;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use process::DataProcess;
 use process::ResultSender;
@@ -160,8 +160,15 @@ impl RingbufConsumer {
     ) where
         P: DataProcess,
     {
+        let mut loop_count = 0;
+        let mut process_time = 0;
+        let mut total_time = 0;
         loop {
+            let start = Instant::now();
+
             process_all_sessions(&self.session_manager, processor).await;
+            process_time += start.elapsed().as_micros() as u64;
+
             if let Some(cancel) = &cancel {
                 tokio::select! {
                     _ = self.notify.notified() => {}
@@ -176,6 +183,17 @@ impl RingbufConsumer {
                     _ = self.notify.notified() => {}
                     _ = sleep(interval) => {}
                 }
+            }
+            total_time += start.elapsed().as_micros() as u64;
+
+            loop_count += 1;
+            if loop_count % 1000 == 0 {
+                tracing::info!(
+                    "business processing utilization rate: {} %",
+                    process_time as f64 * 100.0 / total_time as f64,
+                );
+                process_time = 0;
+                total_time = 0;
             }
         }
     }
