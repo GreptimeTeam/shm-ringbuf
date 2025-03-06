@@ -52,9 +52,33 @@ pub struct ResultFetcher {
     inner: Arc<Inner>,
 }
 
+#[derive(Default)]
 pub struct ResultFetcherMetrics {
     pub requests: AtomicU64,
     pub total_wait_micros: AtomicU64,
+    pub remove_subscription_micros: AtomicU64,
+    pub send_result_micros: AtomicU64,
+}
+
+impl ResultFetcherMetrics {
+    fn record(
+        &self,
+        wait_duration: Duration,
+        remove_subscription_duration: Duration,
+        send_result_duration: Duration,
+    ) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.total_wait_micros
+            .fetch_add(wait_duration.as_micros() as u64, Ordering::Relaxed);
+        self.remove_subscription_micros.fetch_add(
+            remove_subscription_duration.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        self.send_result_micros.fetch_add(
+            send_result_duration.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 struct Inner {
@@ -79,10 +103,7 @@ impl ResultFetcher {
             subscriptions,
             subscription_ttl,
             expirations,
-            metrics: ResultFetcherMetrics {
-                requests: AtomicU64::new(0),
-                total_wait_micros: AtomicU64::new(0),
-            },
+            metrics: ResultFetcherMetrics::default(),
         };
         let inner = Arc::new(inner);
 
@@ -154,21 +175,25 @@ impl ResultFetcher {
 
     async fn handle_result(&self, result: ResultSet) {
         for result in result.results {
+            let now = Instant::now();
             let subscription = self.inner.subscriptions.remove(&result.id);
+            let remove_subscription_elapsed = now.elapsed();
+
             if let Some((_, (sender, start))) = subscription {
                 let result = DataProcessResult {
                     status_code: result.status_code,
                     message: result.message,
                 };
+                let now = Instant::now();
                 let _ = sender.send(result);
+                let send_result_elapsed = now.elapsed();
 
-                self.inner.metrics.requests.fetch_add(1, Ordering::Relaxed);
-
-                let elapsed = start.elapsed().as_micros() as u64;
-                self.inner
-                    .metrics
-                    .total_wait_micros
-                    .fetch_add(elapsed, Ordering::Relaxed);
+                let wait_elapsed = start.elapsed();
+                self.inner.metrics.record(
+                    wait_elapsed,
+                    remove_subscription_elapsed,
+                    send_result_elapsed,
+                );
             }
         }
     }
