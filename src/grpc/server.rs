@@ -8,9 +8,7 @@ use futures::Stream;
 use snafu::ResultExt;
 use tokio::fs;
 use tokio::net::UnixListener;
-use tokio::sync::mpsc::channel;
 use tokio::sync::Notify;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic::Request;
@@ -146,19 +144,10 @@ impl ShmControl for ShmCtlHandler {
 
     async fn fetch_result(
         &self,
-        request: Request<proto::FetchResultRequest>,
+        _request: Request<proto::FetchResultRequest>,
     ) -> StdResult<Response<Self::FetchResultStream>, Status> {
-        let req = request.into_inner();
-        let producer_id = req.producer_id;
-
-        let (tx, rx) = channel::<StdResult<proto::ResultSet, Status>>(1024);
-
-        self.session_manager.set_result_sender(&producer_id, tx);
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::FetchResultStream
-        ))
+        // todo
+        unimplemented!()
     }
 }
 

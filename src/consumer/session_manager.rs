@@ -1,18 +1,40 @@
-use std::result::Result as StdResult;
+use moka::sync::Cache;
+use moka::sync::CacheBuilder;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
-
-use moka::sync::Cache;
-use moka::sync::CacheBuilder;
-use tokio::sync::mpsc::Sender;
-use tonic::Status;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing::warn;
 
-use crate::error::DataProcessResult;
+use crate::error::Result;
+use crate::error::{DataProcessResult, IoSnafu};
 use crate::grpc::proto;
+use crate::grpc::proto::ResultSet;
 use crate::ringbuf::Ringbuf;
+use interprocess::local_socket::tokio::SendHalf;
+use snafu::ResultExt;
+use tokio::io::AsyncWriteExt;
+
+pub struct ResultSetSender {
+    tx: SendHalf,
+}
+
+impl ResultSetSender {
+    pub fn new(tx: SendHalf) -> Self {
+        Self { tx }
+    }
+
+    async fn send(&mut self, result_set: &ResultSet) -> Result<()> {
+        let msg = bincode::serialize(result_set)
+            .unwrap_or_else(|e| panic!("todo: {e:?}"));
+        self.tx
+            .write_all(&usize::to_be_bytes(msg.len()))
+            .await
+            .context(IoSnafu)?;
+        self.tx.write_all(&msg).await.context(IoSnafu)
+    }
+}
 
 /// When each client connects, the server will generate a session to save relevant
 /// information.
@@ -20,7 +42,7 @@ pub struct Session {
     client_id: ClientId,
     ringbuf: RwLock<Option<Arc<Ringbuf>>>,
     /// Send the results of data processing to the producer.
-    result_sender: RwLock<Option<Sender<StdResult<proto::ResultSet, Status>>>>,
+    result_sender: Arc<Mutex<Option<ResultSetSender>>>,
 }
 pub type SessionRef = Arc<Session>;
 
@@ -30,7 +52,7 @@ impl Session {
         Self {
             client_id,
             ringbuf: RwLock::new(None),
-            result_sender: RwLock::new(None),
+            result_sender: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -55,9 +77,8 @@ impl Session {
         request_id: u32,
         result: impl Into<DataProcessResult>,
     ) {
-        let sender = (*self.result_sender.read().unwrap()).clone();
-
-        if let Some(sender) = sender {
+        let mut sender = self.result_sender.lock().await;
+        if let Some(sender) = sender.as_mut() {
             let DataProcessResult {
                 status_code,
                 message,
@@ -69,12 +90,10 @@ impl Session {
                 message,
             };
 
-            if let Err(e) = sender
-                .send(Ok(proto::ResultSet {
-                    results: vec![result],
-                }))
-                .await
-            {
+            let result_set = ResultSet {
+                results: vec![result],
+            };
+            if let Err(e) = sender.send(&result_set).await {
                 warn!("failed to send result to producer, error: {}", e);
             }
         }
@@ -117,17 +136,17 @@ impl SessionManager {
 
     /// Set the result sender of the session. If the session does not exist, it
     /// will be created first.
-    pub fn set_result_sender(
+    pub async fn set_result_sender(
         &self,
         id: &ClientId,
-        sender: Sender<std::result::Result<proto::ResultSet, Status>>,
+        sender: ResultSetSender,
     ) {
         let entry = self
             .sessions
             .entry(id.clone())
             .or_insert_with(|| Arc::new(Session::new(id.clone())));
 
-        entry.value().result_sender.write().unwrap().replace(sender);
+        entry.value().result_sender.lock().await.replace(sender);
     }
 
     /// Get a session from the session manager and refresh the tti.

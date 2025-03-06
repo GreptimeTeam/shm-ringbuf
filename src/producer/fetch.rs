@@ -1,29 +1,49 @@
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use snafu::ensure;
-use snafu::ResultExt;
+use interprocess::local_socket::tokio::RecvHalf;
+use snafu::{ensure, ResultExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot::channel;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::oneshot::Sender;
 use tokio::time::sleep;
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tonic::Streaming;
 use tracing::debug;
 
 use crate::error;
-use crate::error::DataProcessResult;
 use crate::error::Result;
-use crate::grpc::client::GrpcClient;
+use crate::error::{DataProcessResult, IoSnafu};
 use crate::grpc::proto::ResultSet;
 
 pub type RequestId = u32;
+
+pub struct ResultSetReceiver {
+    rx: RecvHalf,
+}
+
+impl ResultSetReceiver {
+    pub fn new(rx: RecvHalf) -> Self {
+        Self { rx }
+    }
+
+    async fn recv(&mut self) -> Result<ResultSet> {
+        let mut msg_len = [0u8; size_of::<usize>()];
+        self.rx.read_exact(&mut msg_len).await.context(IoSnafu)?;
+        let msg_len = usize::from_be_bytes(msg_len);
+
+        let mut msg = vec![0; msg_len];
+        self.rx.read_exact(&mut msg).await.context(IoSnafu)?;
+        let result_set = bincode::deserialize::<ResultSet>(&msg)
+            .unwrap_or_else(|e| panic!("todo: {e:?}"));
+        Ok(result_set)
+    }
+}
 
 /// The [`ResultFetcher`] has two abilities:
 /// 1. Fetch the results of data processing on the consumer side.
@@ -38,8 +58,6 @@ pub struct ResultFetcherMetrics {
 }
 
 struct Inner {
-    grpc_client: GrpcClient,
-    normal: AtomicBool,
     subscriptions: DashMap<RequestId, (Sender<DataProcessResult>, Instant)>,
     subscription_ttl: Duration,
     expirations: RwLock<VecDeque<(RequestId, Instant)>>,
@@ -48,20 +66,16 @@ struct Inner {
 
 impl ResultFetcher {
     pub async fn new(
-        grpc_client: GrpcClient,
-        reconnect_interval: Duration,
+        result_set_receiver: ResultSetReceiver,
         // The interval for checking the expired result fetch subscriptions.
         expired_check_interval: Duration,
         subscription_ttl: Duration,
         cancel: CancellationToken,
     ) -> ResultFetcher {
-        let normal = AtomicBool::new(false);
         let subscriptions = DashMap::new();
         let expirations = RwLock::new(VecDeque::new());
 
         let inner = Inner {
-            grpc_client,
-            normal,
             subscriptions,
             subscription_ttl,
             expirations,
@@ -94,29 +108,17 @@ impl ResultFetcher {
             }
         });
 
-        // Try to fetch the result stream and update the normal flag immediately.
-        let may_stream = fetcher.inner.grpc_client.fetch_result().await;
-        if let Err(e) = &may_stream {
-            debug!("failed to fetch result stream, detail: {:?}", e);
-            inner.normal.store(false, Ordering::Relaxed);
-        } else {
-            inner.normal.store(true, Ordering::Relaxed);
-        }
-
         // Start a task to fetch the result stream.
-        tokio::spawn(async move {
-            let mut may_stream = may_stream.ok();
-            loop {
-                if let Some(stream) = may_stream.take() {
-                    if let Err(e) = fetcher.handle_stream(stream).await {
-                        debug!("failed to handle stream, detail: {:?}", e);
-                    }
-                } else if let Err(e) = fetcher.fetch_result_stream().await {
-                    debug!("failed to fetch result, detail: {:?}", e);
-                };
-
-                fetcher.inner.normal.store(false, Ordering::Relaxed);
-                sleep(reconnect_interval).await;
+        tokio::spawn({
+            let mut result_set_receiver = result_set_receiver;
+            async move {
+                loop {
+                    let result_set = result_set_receiver
+                        .recv()
+                        .await
+                        .unwrap_or_else(|e| panic!("todo: {e:?}"));
+                    fetcher.handle_result(result_set).await;
+                }
             }
         });
 
@@ -146,27 +148,8 @@ impl ResultFetcher {
 
     /// Check if the result fetcher is working normally.
     pub fn is_normal(&self) -> bool {
-        self.inner.normal.load(Ordering::Relaxed)
-    }
-
-    async fn fetch_result_stream(&self) -> Result<()> {
-        let result_stream = self.inner.grpc_client.fetch_result().await?;
-
-        self.inner.normal.store(true, Ordering::Relaxed);
-
-        self.handle_stream(result_stream).await
-    }
-
-    async fn handle_stream(
-        &self,
-        mut result_stream: Streaming<ResultSet>,
-    ) -> Result<()> {
-        while let Some(may_result) = result_stream.next().await {
-            let result = may_result.context(error::TonicSnafu)?;
-            self.handle_result(result).await;
-        }
-
-        Ok(())
+        // todo
+        true
     }
 
     async fn handle_result(&self, result: ResultSet) {

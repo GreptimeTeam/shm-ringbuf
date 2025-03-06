@@ -1,3 +1,14 @@
+use crate::consumer::session_manager::{ResultSetSender, SessionManagerRef};
+use crate::error;
+use crate::error::{IoSnafu, Result};
+use crate::producer::fetch::ResultSetReceiver;
+use crate::ringbuf::Ringbuf;
+use interprocess::local_socket;
+use interprocess::local_socket::traits::tokio::{Listener, Stream};
+use interprocess::local_socket::ToFsName;
+use passfd::tokio::FdPassingExt;
+use snafu::location;
+use snafu::ResultExt;
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -6,10 +17,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::time::Duration;
-
-use passfd::tokio::FdPassingExt;
-use snafu::location;
-use snafu::ResultExt;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -17,11 +24,6 @@ use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-
-use crate::consumer::session_manager::SessionManagerRef;
-use crate::error;
-use crate::error::Result;
-use crate::ringbuf::Ringbuf;
 
 /// Ringbuf is ready in consumer.
 pub const RINGBUF_READY: u32 = 0;
@@ -123,6 +125,7 @@ where
         info!("accept a new unix stream for sending fd.");
 
         let mut handler = Handler {
+            client_id: None,
             stream,
             session_manager: self.session_manager.clone(),
         };
@@ -136,6 +139,7 @@ where
 }
 
 struct Handler {
+    client_id: Option<String>,
     stream: UnixStream,
     session_manager: SessionManagerRef,
 }
@@ -151,6 +155,38 @@ impl Handler {
         } else if let Err(e) = write_ok(&mut self.stream).await {
             error!("failed to write ok to unix stream, err: {}", e);
         }
+
+        if let Some(client_id) = self.client_id.take() {
+            let sender = self
+                .create_result_set_sender()
+                .await
+                .unwrap_or_else(|e| panic!("todo: {e:?}"));
+            self.session_manager
+                .set_result_sender(&client_id, sender)
+                .await;
+        }
+    }
+
+    async fn create_result_set_sender(&mut self) -> Result<ResultSetSender> {
+        let len = self.stream.read_u32().await.context(IoSnafu)?;
+        let mut buf = vec![0; len as usize];
+        self.stream.read_exact(&mut buf).await.context(IoSnafu)?;
+        let result_set_listener_name =
+            String::from_utf8(buf).unwrap_or_else(|e| panic!("todo: {e:?}"));
+
+        let result_set_listener_name = result_set_listener_name
+            .to_fs_name::<local_socket::GenericFilePath>()
+            .unwrap_or_else(|e| panic!("todo: {e:?}"));
+        info!(
+            "Trying to connect to result set listener: {:?}",
+            result_set_listener_name
+        );
+        let conn =
+            local_socket::tokio::Stream::connect(result_set_listener_name)
+                .await
+                .context(IoSnafu)?;
+        let (_rx, tx) = conn.split();
+        Ok(ResultSetSender::new(tx))
     }
 
     async fn do_handle(&mut self) -> Result<()> {
@@ -182,6 +218,7 @@ impl Handler {
         // 6. Set the ringbuf to the session manager.
         self.session_manager.set_ringbuf(&client_id, ringbuf.into());
 
+        self.client_id = Some(client_id);
         Ok(())
     }
 }
@@ -220,7 +257,7 @@ pub async fn send_fd(
     sock_path: impl AsRef<Path>,
     file: &File,
     name: impl Into<String>,
-) -> Result<()> {
+) -> Result<ResultSetReceiver> {
     let mut stream = UnixStream::connect(sock_path.as_ref())
         .await
         .context(error::IoSnafu)?;
@@ -245,7 +282,32 @@ pub async fn send_fd(
             let detail = read_err(&mut stream).await?;
             error::RingbufBuildSnafu { detail }.fail()
         }
-    }
+    }?;
+
+    let result_set_listener_name =
+        format!("/tmp/result_set-{}.sock", uuid::Uuid::new_v4());
+    let opts = local_socket::ListenerOptions::new().name(
+        result_set_listener_name
+            .clone()
+            .to_fs_name::<local_socket::GenericFilePath>()
+            .unwrap_or_else(|e| panic!("todo: {e:?}")),
+    );
+    let listener = opts.create_tokio().context(IoSnafu)?;
+    info!("Created result set listener: {}", result_set_listener_name);
+
+    // Send the socket file name after the listener is created, to ensure the file is created.
+    stream
+        .write_u32(result_set_listener_name.len() as u32)
+        .await
+        .context(IoSnafu)?;
+    stream
+        .write_all(result_set_listener_name.as_bytes())
+        .await
+        .context(IoSnafu)?;
+
+    let stream = listener.accept().await.context(IoSnafu)?;
+    let (rx, _tx) = stream.split();
+    Ok(ResultSetReceiver::new(rx))
 }
 
 /// Write the error msg to the unix stream.

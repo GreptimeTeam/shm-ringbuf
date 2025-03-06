@@ -16,6 +16,8 @@ pub struct ProducerSettings {
     pub(super) ringbuf_len: usize,
     pub(super) heartbeat_interval: Duration,
     pub(super) enable_result_fetch: bool,
+    // todo
+    #[allow(unused)]
     pub(super) reconnect_interval: Duration,
     pub(super) expired_check_interval: Duration,
     pub(super) subscription_ttl: Duration,

@@ -4,6 +4,8 @@ pub mod settings;
 pub mod fetch;
 mod heartbeat;
 
+use fetch::ResultFetcher;
+use settings::ProducerSettings;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -11,9 +13,6 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::RwLock;
-
-use fetch::ResultFetcher;
-use settings::ProducerSettings;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
@@ -24,6 +23,7 @@ use crate::fd_pass::send_fd;
 use crate::grpc::client::GrpcClient;
 use crate::memfd::create_fd;
 use crate::memfd::Settings;
+use crate::producer::fetch::ResultSetReceiver;
 use crate::ringbuf::Ringbuf;
 
 /// The producer of the ringbuf based on shared memory.
@@ -49,7 +49,7 @@ impl RingbufProducer {
             fdpass_sock_path,
             heartbeat_interval,
             enable_result_fetch,
-            reconnect_interval,
+            reconnect_interval: _,
             expired_check_interval,
             subscription_ttl,
             enable_checksum,
@@ -89,6 +89,7 @@ impl RingbufProducer {
             fdpass_sock_path,
             memfd,
         };
+        let result_set_receiver = session_handle.send().await?;
 
         let heartbeat = heartbeat::Heartbeat {
             client: grpc_client.clone(),
@@ -104,8 +105,7 @@ impl RingbufProducer {
         let result_fetcher = if enable_result_fetch {
             Some(
                 ResultFetcher::new(
-                    grpc_client.clone(),
-                    reconnect_interval,
+                    result_set_receiver,
                     expired_check_interval,
                     subscription_ttl,
                     cancel_c,
@@ -219,7 +219,7 @@ pub(crate) struct SessionHandle {
 pub(crate) type SessionHandleRef = Arc<SessionHandle>;
 
 impl SessionHandle {
-    pub async fn send(&self) -> Result<()> {
+    pub async fn send(&self) -> Result<ResultSetReceiver> {
         send_fd(&self.fdpass_sock_path, &self.memfd, self.client_id.clone())
             .await
     }
